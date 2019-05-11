@@ -32,6 +32,7 @@
 /*#define CONFIG_AM_VDEC_DV*/
 
 #include "vdec_input.h"
+#include "frame_check.h"
 
 s32 vdec_dev_register(void);
 s32 vdec_dev_unregister(void);
@@ -42,6 +43,8 @@ int hevc_source_changed(int format, int width, int height, int fps);
 struct device *get_vdec_device(void);
 int vdec_module_init(void);
 void vdec_module_exit(void);
+
+#define MAX_INSTANCE_MUN  9
 
 #define VDEC_DEBUG_SUPPORT
 
@@ -147,7 +150,7 @@ enum vformat_t;
 
 #define VDEC_PROVIDER_NAME_SIZE 16
 #define VDEC_RECEIVER_NAME_SIZE 16
-#define VDEC_MAP_NAME_SIZE      45
+#define VDEC_MAP_NAME_SIZE      90
 
 #define VDEC_FLAG_OTHER_INPUT_CONTEXT 0x0
 #define VDEC_FLAG_SELF_INPUT_CONTEXT 0x01
@@ -180,6 +183,7 @@ struct vdec_s {
 	int flag;
 	int sched;
 	int need_more_data;
+	u32 canvas_mode;
 
 	struct completion inactive_done;
 
@@ -196,6 +200,8 @@ struct vdec_s {
 
 	/* input */
 	struct vdec_input_s input;
+
+	struct pic_check_mgr_t vfc;
 
 	/* mc cache */
 	u32 mc[4096 * 4];
@@ -224,6 +230,7 @@ struct vdec_s {
 	int (*dec_status)(struct vdec_s *vdec, struct vdec_info *vstatus);
 	int (*set_trickmode)(struct vdec_s *vdec, unsigned long trickmode);
 	int (*set_isreset)(struct vdec_s *vdec, int isreset);
+	void (*vdec_fps_detec)(int id);
 
 	unsigned long (*run_ready)(struct vdec_s *vdec, unsigned long mask);
 	void (*run)(struct vdec_s *vdec, unsigned long mask,
@@ -236,7 +243,7 @@ struct vdec_s {
 	int (*user_data_read)(struct vdec_s *vdec,
 			struct userdata_param_t *puserdata_para);
 	void (*reset_userdata_fifo)(struct vdec_s *vdec, int bInit);
-	void (*wakeup_userdata_poll)(void);
+	void (*wakeup_userdata_poll)(struct vdec_s *vdec);
 	/* private */
 	void *private;       /* decoder per instance specific data */
 #ifdef VDEC_DEBUG_SUPPORT
@@ -420,6 +427,8 @@ int vdec_wakeup_userdata_poll(struct vdec_s *vdec);
 
 void vdec_reset_userdata_fifo(struct vdec_s *vdec, int bInit);
 
+struct vdec_s *vdec_get_vdec_by_id(int vdec_id);
+
 #ifdef VDEC_DEBUG_SUPPORT
 extern void vdec_set_step_mode(void);
 #endif
@@ -430,5 +439,9 @@ unsigned char is_mult_inc(unsigned int);
 int vdec_get_status(struct vdec_s *vdec);
 
 void vdec_set_timestamp(struct vdec_s *vdec, u64 timestamp);
+
+struct vdec_s *vdec_get_with_id(unsigned id);
+
+void *vdec_get_active_vfc(int core_mask);
 
 #endif				/* VDEC_H */

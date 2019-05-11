@@ -68,6 +68,7 @@
 #include <linux/amlogic/media/frame_sync/ptsserv.h>
 #include "secprot.h"
 #include "../../../common/chips/decoder_cpu_ver_info.h"
+#include "frame_check.h"
 
 static DEFINE_MUTEX(vdec_mutex);
 
@@ -84,14 +85,16 @@ static unsigned int clk_config;
 /*
    &1: sched_priority to MAX_RT_PRIO -1.
    &2: always reload firmware.
+   &4: vdec canvas debug enable
   */
 static unsigned int debug;
 
 static int hevc_max_reset_count;
-#define MAX_INSTANCE_MUN  9
 
 static int no_powerdown;
 static int parallel_decode = 1;
+static int fps_detection;
+static int fps_clear;
 static DEFINE_SPINLOCK(vdec_spin_lock);
 
 #define HEVC_TEST_LIMIT 100
@@ -113,10 +116,18 @@ struct vdec_isr_context_s {
 	struct vdec_s *vdec;
 };
 
+struct decode_fps_s {
+	u32 frame_count;
+	u64 start_timestamp;
+	u64 last_timestamp;
+	u32 fps;
+};
+
 struct vdec_core_s {
 	struct list_head connected_vdec_list;
 	spinlock_t lock;
 	spinlock_t canvas_lock;
+	spinlock_t fps_lock;
 	struct ida ida;
 	atomic_t vdec_nr;
 	struct vdec_s *vfm_vdec;
@@ -136,6 +147,7 @@ struct vdec_core_s {
 	int parallel_dec;
 	unsigned long power_ref_mask;
 	int vdec_combine_flag;
+	struct decode_fps_s decode_fps[MAX_INSTANCE_MUN];
 };
 
 struct canvas_status_s {
@@ -206,6 +218,18 @@ void vdec_canvas_unlock(struct vdec_core_s *core, unsigned long flags)
 	spin_unlock_irqrestore(&core->canvas_lock, flags);
 }
 
+unsigned long vdec_fps_lock(struct vdec_core_s *core)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&core->fps_lock, flags);
+
+	return flags;
+}
+
+void vdec_fps_unlock(struct vdec_core_s *core, unsigned long flags)
+{
+	spin_unlock_irqrestore(&core->fps_lock, flags);
+}
 
 unsigned long vdec_core_lock(struct vdec_core_s *core)
 {
@@ -220,6 +244,75 @@ void vdec_core_unlock(struct vdec_core_s *core, unsigned long flags)
 {
 	spin_unlock_irqrestore(&core->lock, flags);
 }
+
+static u64 vdec_get_us_time_system(void)
+{
+	struct timeval tv;
+
+	do_gettimeofday(&tv);
+
+	return div64_u64(timeval_to_ns(&tv), 1000);
+}
+
+static void vdec_fps_clear(int id)
+{
+	if (id >= MAX_INSTANCE_MUN)
+		return;
+
+	vdec_core->decode_fps[id].frame_count = 0;
+	vdec_core->decode_fps[id].start_timestamp = 0;
+	vdec_core->decode_fps[id].last_timestamp = 0;
+	vdec_core->decode_fps[id].fps = 0;
+}
+
+static void vdec_fps_clearall(void)
+{
+	int i;
+
+	for (i = 0; i < MAX_INSTANCE_MUN; i++) {
+		vdec_core->decode_fps[i].frame_count = 0;
+		vdec_core->decode_fps[i].start_timestamp = 0;
+		vdec_core->decode_fps[i].last_timestamp = 0;
+		vdec_core->decode_fps[i].fps = 0;
+	}
+}
+
+static void vdec_fps_detec(int id)
+{
+	unsigned long flags;
+
+	if (fps_detection == 0)
+		return;
+
+	if (id >= MAX_INSTANCE_MUN)
+		return;
+
+	flags = vdec_fps_lock(vdec_core);
+
+	if (fps_clear == 1) {
+		vdec_fps_clearall();
+		fps_clear = 0;
+	}
+
+	vdec_core->decode_fps[id].frame_count++;
+	if (vdec_core->decode_fps[id].frame_count == 1) {
+		vdec_core->decode_fps[id].start_timestamp =
+			vdec_get_us_time_system();
+		vdec_core->decode_fps[id].last_timestamp =
+			vdec_core->decode_fps[id].start_timestamp;
+	} else {
+		vdec_core->decode_fps[id].last_timestamp =
+			vdec_get_us_time_system();
+		vdec_core->decode_fps[id].fps =
+				(u32)div_u64(((u64)(vdec_core->decode_fps[id].frame_count) *
+					10000000000),
+					(vdec_core->decode_fps[id].last_timestamp -
+					vdec_core->decode_fps[id].start_timestamp));
+	}
+	vdec_fps_unlock(vdec_core, flags);
+}
+
+
 
 static int get_canvas(unsigned int index, unsigned int base)
 {
@@ -271,7 +364,8 @@ static int get_canvas_ex(int type, int id)
 			(canvas_stat[i].id & (1 << id)) == 0) {
 			canvas_stat[i].canvas_used_flag++;
 			canvas_stat[i].id |= (1 << id);
-			pr_debug("get used canvas %d\n", i);
+			if (debug & 4)
+				pr_debug("get used canvas %d\n", i);
 			vdec_canvas_unlock(vdec_core, flags);
 			if (i < AMVDEC_CANVAS_MAX2 + 1)
 				return i;
@@ -288,11 +382,13 @@ static int get_canvas_ex(int type, int id)
 			canvas_stat[i].type = type;
 			canvas_stat[i].canvas_used_flag = 1;
 			canvas_stat[i].id = (1 << id);
-			pr_debug("get canvas %d\n", i);
-			pr_debug("canvas_used_flag %d\n",
-				canvas_stat[i].canvas_used_flag);
-			pr_debug("canvas_stat[i].id %d\n",
-				canvas_stat[i].id);
+			if (debug & 4) {
+				pr_debug("get canvas %d\n", i);
+				pr_debug("canvas_used_flag %d\n",
+					canvas_stat[i].canvas_used_flag);
+				pr_debug("canvas_stat[i].id %d\n",
+					canvas_stat[i].id);
+			}
 			vdec_canvas_unlock(vdec_core, flags);
 			if (i < AMVDEC_CANVAS_MAX2 + 1)
 				return i;
@@ -332,11 +428,13 @@ static void free_canvas_ex(int index, int id)
 			canvas_stat[offset].type = 0;
 			canvas_stat[offset].id = 0;
 		}
-		pr_debug("free index %d used_flag %d, type = %d, id = %d\n",
-			offset,
-			canvas_stat[offset].canvas_used_flag,
-			canvas_stat[offset].type,
-			canvas_stat[offset].id);
+		if (debug & 4) {
+			pr_debug("free index %d used_flag %d, type = %d, id = %d\n",
+				offset,
+				canvas_stat[offset].canvas_used_flag,
+				canvas_stat[offset].type,
+				canvas_stat[offset].id);
+		}
 	}
 	vdec_canvas_unlock(vdec_core, flags);
 
@@ -1608,6 +1706,30 @@ static const char *get_dev_name(bool use_legacy_vdec, int format)
 #endif
 }
 
+struct vdec_s *vdec_get_with_id(unsigned id)
+{
+	struct vdec_s *vdec, *ret_vdec = NULL;
+	struct vdec_core_s *core = vdec_core;
+	unsigned long flags;
+
+	if (id >= MAX_INSTANCE_MUN)
+		return NULL;
+
+	flags = vdec_core_lock(vdec_core);
+	if (!list_empty(&core->connected_vdec_list)) {
+		list_for_each_entry(vdec, &core->connected_vdec_list, list) {
+			if (vdec->id == id) {
+				pr_info("searched avaliable vdec connected, id = %d\n", id);
+				ret_vdec = vdec;
+				break;
+			}
+		}
+	}
+	vdec_core_unlock(vdec_core, flags);
+
+	return ret_vdec;
+}
+
 /*
  *register vdec_device
  * create output, vfm or create ionvideo output
@@ -1656,6 +1778,7 @@ s32 vdec_init(struct vdec_s *vdec, int is_4k)
 	p->get_canvas = get_canvas;
 	p->get_canvas_ex = get_canvas_ex;
 	p->free_canvas_ex = free_canvas_ex;
+	p->vdec_fps_detec = vdec_fps_detec;
 	atomic_set(&p->inirq_flag, 0);
 	atomic_set(&p->inirq_thread_flag, 0);
 	/* todo */
@@ -1666,6 +1789,10 @@ s32 vdec_init(struct vdec_s *vdec, int is_4k)
 		id = vdec->id;
 	p->parallel_dec = parallel_decode;
 	vdec_core->parallel_dec = parallel_decode;
+	vdec->canvas_mode = CANVAS_BLKMODE_32X32;
+#ifdef FRAME_CHECK
+	vdec_frame_check_init(vdec);
+#endif
 	p->dev = platform_device_register_data(
 				&vdec_core->vdec_core_platform_device->dev,
 				dev_name,
@@ -1766,7 +1893,7 @@ s32 vdec_init(struct vdec_s *vdec, int is_4k)
 				FRAME_BASE_PATH_AMLVIDEO1_AMVIDEO2) {
 			snprintf(vdec->vfm_map_chain, VDEC_MAP_NAME_SIZE,
 				"%s %s", vdec->vf_provider_name,
-				"ppmgr amlvideo.1 amvide2");
+				"aml_video.1 videosync.0 videopip");
 			snprintf(vdec->vfm_map_id, VDEC_MAP_NAME_SIZE,
 				"vdec-map-%d", vdec->id);
 		} else if (p->frame_base_video_path == FRAME_BASE_PATH_V4L_VIDEO) {
@@ -1902,6 +2029,11 @@ void vdec_release(struct vdec_s *vdec)
 	while ((atomic_read(&vdec->inirq_flag) > 0)
 		|| (atomic_read(&vdec->inirq_thread_flag) > 0))
 		schedule();
+
+#ifdef FRAME_CHECK
+	vdec_frame_check_exit(vdec);
+#endif
+	vdec_fps_clear(vdec->id);
 
 	platform_device_unregister(vdec->dev);
 	pr_debug("vdec_release instance %p, total %d\n", vdec,
@@ -2680,7 +2812,9 @@ void vdec_poweron(enum vdec_type_e core)
 	if (core == VDEC_1) {
 		/* vdec1 power on */
 		WRITE_AOREG(AO_RTI_GEN_PWR_SLEEP0,
-				READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) & ~0xc);
+				READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) &
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? ~0x2 : ~0xc));
 		/* wait 10uS */
 		udelay(10);
 		/* vdec1 soft reset */
@@ -2698,7 +2832,9 @@ void vdec_poweron(enum vdec_type_e core)
 		WRITE_VREG(DOS_MEM_PD_VDEC, 0);
 		/* remove vdec1 isolation */
 		WRITE_AOREG(AO_RTI_GEN_PWR_ISO0,
-				READ_AOREG(AO_RTI_GEN_PWR_ISO0) & ~0xC0);
+				READ_AOREG(AO_RTI_GEN_PWR_ISO0) &
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? ~0x2 : ~0xC0));
 		/* reset DOS top registers */
 		WRITE_VREG(DOS_VDEC_MCRCC_STALL_CTRL, 0);
 		if (get_cpu_major_id() >=
@@ -2739,8 +2875,9 @@ void vdec_poweron(enum vdec_type_e core)
 		if (has_hdec()) {
 			/* hcodec power on */
 			WRITE_AOREG(AO_RTI_GEN_PWR_SLEEP0,
-					READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) &
-					~0x3);
+				READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) &
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? ~0x1 : ~0x3));
 			/* wait 10uS */
 			udelay(10);
 			/* hcodec soft reset */
@@ -2752,8 +2889,9 @@ void vdec_poweron(enum vdec_type_e core)
 			WRITE_VREG(DOS_MEM_PD_HCODEC, 0);
 			/* remove hcodec isolation */
 			WRITE_AOREG(AO_RTI_GEN_PWR_ISO0,
-					READ_AOREG(AO_RTI_GEN_PWR_ISO0) &
-					~0x30);
+				READ_AOREG(AO_RTI_GEN_PWR_ISO0) &
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? ~0x1 : ~0x30));
 		}
 	} else if (core == VDEC_HEVC) {
 		if (has_hevc_vdec()) {
@@ -2763,7 +2901,8 @@ void vdec_poweron(enum vdec_type_e core)
 				/* hevc power on */
 				WRITE_AOREG(AO_RTI_GEN_PWR_SLEEP0,
 					READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) &
-					~0xc0);
+					(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+					? ~0x4 : ~0xc0));
 				/* wait 10uS */
 				udelay(10);
 				/* hevc soft reset */
@@ -2780,7 +2919,8 @@ void vdec_poweron(enum vdec_type_e core)
 				/* remove hevc isolation */
 				WRITE_AOREG(AO_RTI_GEN_PWR_ISO0,
 					READ_AOREG(AO_RTI_GEN_PWR_ISO0) &
-					~0xc00);
+					(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+					? ~0x4 : ~0xc00));
 
 				if (!hevc_workaround_needed())
 					break;
@@ -2858,14 +2998,18 @@ void vdec_poweroff(enum vdec_type_e core)
 		}
 		/* enable vdec1 isolation */
 		WRITE_AOREG(AO_RTI_GEN_PWR_ISO0,
-				READ_AOREG(AO_RTI_GEN_PWR_ISO0) | 0xc0);
+				READ_AOREG(AO_RTI_GEN_PWR_ISO0) |
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? 0x2 : 0xc0));
 		/* power off vdec1 memories */
 		WRITE_VREG(DOS_MEM_PD_VDEC, 0xffffffffUL);
 		/* disable vdec1 clock */
 		vdec_clock_off();
 		/* vdec1 power off */
 		WRITE_AOREG(AO_RTI_GEN_PWR_SLEEP0,
-				READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) | 0xc);
+				READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) |
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? 0x2 : 0xc));
 	} else if (core == VDEC_2) {
 		if (has_vdec2()) {
 			/* enable vdec2 isolation */
@@ -2885,15 +3029,18 @@ void vdec_poweroff(enum vdec_type_e core)
 		if (has_hdec()) {
 			/* enable hcodec isolation */
 			WRITE_AOREG(AO_RTI_GEN_PWR_ISO0,
-					READ_AOREG(AO_RTI_GEN_PWR_ISO0) |
-					0x30);
+				READ_AOREG(AO_RTI_GEN_PWR_ISO0) |
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? 0x1 : 0x30));
 			/* power off hcodec memories */
 			WRITE_VREG(DOS_MEM_PD_HCODEC, 0xffffffffUL);
 			/* disable hcodec clock */
 			hcodec_clock_off();
 			/* hcodec power off */
 			WRITE_AOREG(AO_RTI_GEN_PWR_SLEEP0,
-					READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) | 3);
+				READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) |
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? 0x1 : 3));
 		}
 	} else if (core == VDEC_HEVC) {
 		if (has_hevc_vdec()) {
@@ -2901,7 +3048,8 @@ void vdec_poweroff(enum vdec_type_e core)
 				/* enable hevc isolation */
 				WRITE_AOREG(AO_RTI_GEN_PWR_ISO0,
 					READ_AOREG(AO_RTI_GEN_PWR_ISO0) |
-					0xc00);
+					(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+					? 0x4 : 0xc00));
 			/* power off hevc memories */
 			WRITE_VREG(DOS_MEM_PD_HEVC, 0xffffffffUL);
 
@@ -2912,8 +3060,9 @@ void vdec_poweroff(enum vdec_type_e core)
 
 			/* hevc power off */
 			WRITE_AOREG(AO_RTI_GEN_PWR_SLEEP0,
-					READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) |
-					0xc0);
+				READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) |
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? 0x4 : 0xc0));
 			} else {
 				pr_info("!!!!!!!!not power down\n");
 				hevc_reset_core(NULL);
@@ -2930,7 +3079,9 @@ bool vdec_on(enum vdec_type_e core)
 	bool ret = false;
 
 	if (core == VDEC_1) {
-		if (((READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) & 0xc) == 0) &&
+		if (((READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) &
+			(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+			? 0x2 : 0xc)) == 0) &&
 			(READ_HHI_REG(HHI_VDEC_CLK_CNTL) & 0x100))
 			ret = true;
 	} else if (core == VDEC_2) {
@@ -2941,13 +3092,17 @@ bool vdec_on(enum vdec_type_e core)
 		}
 	} else if (core == VDEC_HCODEC) {
 		if (has_hdec()) {
-			if (((READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) & 0x3) == 0) &&
+			if (((READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) &
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? 0x1 : 0x3)) == 0) &&
 				(READ_HHI_REG(HHI_VDEC_CLK_CNTL) & 0x1000000))
 				ret = true;
 		}
 	} else if (core == VDEC_HEVC) {
 		if (has_hevc_vdec()) {
-			if (((READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) & 0xc0) == 0) &&
+			if (((READ_AOREG(AO_RTI_GEN_PWR_SLEEP0) &
+				(get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_SM1
+				? 0x4 : 0xc0)) == 0) &&
 				(READ_HHI_REG(HHI_VDEC2_CLK_CNTL) & 0x1000000))
 				ret = true;
 		}
@@ -3696,6 +3851,31 @@ struct vdec_s *vdec_get_default_vdec_for_userdata(void)
 }
 EXPORT_SYMBOL(vdec_get_default_vdec_for_userdata);
 
+struct vdec_s *vdec_get_vdec_by_id(int vdec_id)
+{
+	struct vdec_s *vdec;
+	struct vdec_s *ret_vdec;
+	struct vdec_core_s *core = vdec_core;
+	unsigned long flags;
+
+	flags = vdec_core_lock(vdec_core);
+
+	ret_vdec = NULL;
+	if (!list_empty(&core->connected_vdec_list)) {
+		list_for_each_entry(vdec, &core->connected_vdec_list, list) {
+			if (vdec->id == vdec_id) {
+				ret_vdec = vdec;
+				break;
+			}
+		}
+	}
+
+	vdec_core_unlock(vdec_core, flags);
+
+	return ret_vdec;
+}
+EXPORT_SYMBOL(vdec_get_vdec_by_id);
+
 int vdec_read_user_data(struct vdec_s *vdec,
 			struct userdata_param_t *p_userdata_param)
 {
@@ -3714,9 +3894,9 @@ EXPORT_SYMBOL(vdec_read_user_data);
 
 int vdec_wakeup_userdata_poll(struct vdec_s *vdec)
 {
-	if (vdec && vdec == vdec_get_default_vdec_for_userdata()) {
+	if (vdec) {
 		if (vdec->wakeup_userdata_poll)
-			vdec->wakeup_userdata_poll();
+			vdec->wakeup_userdata_poll(vdec);
 	}
 
 	return 0;
@@ -3998,6 +4178,23 @@ static ssize_t dump_decoder_state_show(struct class *class,
 	return pbuf - buf;
 }
 
+static ssize_t dump_fps_show(struct class *class,
+			struct class_attribute *attr, char *buf)
+{
+	char *pbuf = buf;
+	struct vdec_core_s *core = vdec_core;
+	int i;
+
+	unsigned long flags = vdec_fps_lock(vdec_core);
+	for (i = 0; i < MAX_INSTANCE_MUN; i++)
+		pbuf += sprintf(pbuf, "%d ", core->decode_fps[i].fps);
+
+	pbuf += sprintf(pbuf, "\n");
+	vdec_fps_unlock(vdec_core, flags);
+
+	return pbuf - buf;
+}
+
 
 
 static struct class_attribute vdec_class_attrs[] = {
@@ -4019,6 +4216,13 @@ static struct class_attribute vdec_class_attrs[] = {
 	__ATTR(debug, S_IRUGO | S_IWUSR | S_IWGRP,
 	show_debug, store_debug),
 #endif
+#ifdef FRAME_CHECK
+	__ATTR(dump_yuv, S_IRUGO | S_IWUSR | S_IWGRP,
+	dump_yuv_show, dump_yuv_store),
+	__ATTR(frame_check, S_IRUGO | S_IWUSR | S_IWGRP,
+	frame_check_show, frame_check_store),
+#endif
+	__ATTR_RO(dump_fps),
 	__ATTR_NULL
 };
 
@@ -4103,6 +4307,7 @@ static int vdec_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&vdec_core->connected_vdec_list);
 	spin_lock_init(&vdec_core->lock);
 	spin_lock_init(&vdec_core->canvas_lock);
+	spin_lock_init(&vdec_core->fps_lock);
 	ida_init(&vdec_core->ida);
 	vdec_core->thread = kthread_run(vdec_core_thread, vdec_core,
 					"vdec-core");
@@ -4236,6 +4441,8 @@ module_param(clk_config, uint, 0664);
 module_param(step_mode, int, 0664);
 module_param(debugflags, int, 0664);
 module_param(parallel_decode, int, 0664);
+module_param(fps_detection, int, 0664);
+module_param(fps_clear, int, 0664);
 
 /*
 *module_init(vdec_module_init);
